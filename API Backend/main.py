@@ -319,13 +319,9 @@ class RoleplayOrchestrator:
         self.app.simulated_scan = self.on_lore_scan
         self.app.mock_image_generation = self.on_image_generation
         self.app.trigger_wipe_maintenance = self.on_wipe_maintenance
-
-        # --- MAP NEW ACTIONS ---
-        # Map these to key binds or call them from custom Tkinter buttons!
-        self.app.bind("<Control-r>", lambda e: self.trigger_reroll())
-        self.app.bind("<Control-Left>", lambda e: self.cycle_reroll(-1))
-        self.app.bind("<Control-Right>", lambda e: self.cycle_reroll(1))
-        self.app.bind("<Control-BackSpace>", lambda e: self.delete_last_message())
+        self.app.handle_reroll_message = self.trigger_reroll
+        self.app.handle_cycle_reroll = self.cycle_reroll
+        self.app.handle_delete_from_message = self.delete_from_message
 
         # Character/Session system hooks
         self.app.handle_character_dropdown_changed = self.on_character_changed
@@ -951,19 +947,14 @@ CRITICAL RULES:
 
         self.app.input_field.delete("1.0", tk.END)
 
-        # Draw to UI
-        self.app.chat_log.configure(state="normal")
         active_user = self.active_user_name if self.active_user_name != "New User..." else "You"
-        self.app.chat_log.insert(tk.END, f"\n👤 {active_user}:\n", "user_tag")
-        self.app.append_roleplay_text(user_input)
-        self.app.chat_log.configure(state="disabled")
-        self.app.chat_log.see(tk.END)
 
         # 2. CLEAR REROLL STATE FOR NEW TURN
         self.reroll_cache = []
         self.reroll_index = -1
 
         self.memory.add_user_message(user_input, active_user)
+        self.render_active_memory_to_ui()
         # We save the user's message to disk immediately
         self.db.save_session_history(self.memory.active_filename, self.memory.active_turns)
         
@@ -1006,40 +997,50 @@ CRITICAL RULES:
     def render_active_memory_to_ui(self):
         """Renders the current in-memory active turns directly to the screen without reloading from disk."""
         self.app.chat_log.configure(state="normal")
+        self.app.clear_chat_message_controls()
         self.app.chat_log.delete("1.0", tk.END)
 
-        for turn in self.memory.active_turns:
+        for turn_index, turn in enumerate(self.memory.active_turns):
             role = turn.get("role", "system")
             content = turn.get("content", "")
             speaker = turn.get("name") or turn.get("speaker") or self.active_user_name
             bot = self.active_bot_name
 
             if role in ("user", "<user>"):
-                self.app.chat_log.insert(tk.END, f"\n👤 {speaker}:\n", "user_tag")
+                self.app.append_message_header(f"User: {speaker}", "user_tag", "user", turn_index)
                 self.app.append_roleplay_text(content)
+                self.app.append_message_separator()
             elif role == "assistant":
-                self.app.chat_log.insert(tk.END, f"\n🧝 {bot}:\n", "bot_tag")
+                self.app.append_message_header(f"Bot: {bot}", "bot_tag", "assistant", turn_index)
                 self.app.append_roleplay_text(content)
+                self.app.append_message_separator()
             elif role == "system":
-                self.app.chat_log.insert(tk.END, f"\n⚙ [System Info]\n", "system_tag")
+                self.app.append_message_header("System Info", "system_tag", "system", turn_index)
                 self.app.append_roleplay_text(content)
+                self.app.append_message_separator()
 
         self.app.chat_log.configure(state="disabled")
         self.app.chat_log.see(tk.END)
 
-    def trigger_reroll(self):
+    def trigger_reroll(self, turn_index=None):
         """Initiates a reroll of the last assistant turn, discarding it from disk and fetching a new response."""
         if not self.memory.active_turns:
             return
 
+        if turn_index is None:
+            turn_index = len(self.memory.active_turns) - 1
+        if turn_index != len(self.memory.active_turns) - 1:
+            self.app.append_system_msg("Only the latest assistant reply can be rerolled.")
+            return
+
         # Ensure the last message is actually from the assistant
-        if self.memory.active_turns[-1].get("role") != "assistant":
+        if self.memory.active_turns[turn_index].get("role") != "assistant":
             self.app.append_system_msg("Cannot reroll: The last message was not sent by the assistant.")
             return
 
         # Find the last user message to prompt the API with
         last_user_message = ""
-        for turn in reversed(self.memory.active_turns):
+        for turn in reversed(self.memory.active_turns[:turn_index]):
             if turn.get("role") in ("user", "<user>"):
                 last_user_message = turn.get("content", "")
                 break
@@ -1051,8 +1052,11 @@ CRITICAL RULES:
         self.app.append_system_msg("Generating alternative response...")
         threading.Thread(target=self._async_chat_placeholder, args=(last_user_message,), daemon=True).start()
 
-    def cycle_reroll(self, direction: int):
+    def cycle_reroll(self, turn_index: int, direction: int):
         """Cycles between cached rerolls (direction can be -1 for Prev, 1 for Next)."""
+        if turn_index != len(self.memory.active_turns) - 1:
+            self.app.append_system_msg("Only the latest assistant reply has selectable versions.")
+            return
         if not self.reroll_cache or len(self.reroll_cache) <= 1:
             self.app.append_system_msg("No alternative rerolls available to switch between.")
             return
@@ -1071,6 +1075,20 @@ CRITICAL RULES:
             self.app.append_system_msg(f"Switched to variation {self.reroll_index + 1}/{len(self.reroll_cache)}")
         else:
             self.app.append_system_msg("Reached end of alternative variations.")
+
+    def delete_from_message(self, turn_index: int):
+        """Delete a selected user message and every later message in the session."""
+        if turn_index < 0 or turn_index >= len(self.memory.active_turns):
+            return
+        if self.memory.active_turns[turn_index].get("role") not in ("user", "<user>"):
+            self.app.append_system_msg("Only user messages can rewind the conversation.")
+            return
+
+        self.memory.active_turns = self.memory.active_turns[:turn_index]
+        self.reroll_cache = []
+        self.reroll_index = -1
+        self.db.save_session_history(self.memory.active_filename, self.memory.active_turns)
+        self.render_active_memory_to_ui()
 
     def on_force_summary(self):
         self.app.append_system_msg("Manual summary integration worker called.")

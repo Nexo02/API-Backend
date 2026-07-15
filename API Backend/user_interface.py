@@ -445,6 +445,8 @@ class OrganizedRoleplayApp(ctk.CTk):
         self.chat_log = ctk.CTkTextbox(self.chat_pane, font=ctk.CTkFont(size=14), wrap="word")
         self.chat_log.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         self.chat_log.configure(state="disabled")
+        self.chat_menu_buttons = []
+        self.chat_log._textbox.bind("<Configure>", self._configure_header_tab)
 
         # Configure initial visual tags (these will be scaled dynamically)
         self.chat_log.tag_config("user_tag", foreground="#8fbbf0", font=ctk.CTkFont(weight="bold"))
@@ -452,6 +454,7 @@ class OrganizedRoleplayApp(ctk.CTk):
         
         # Base Environment Colors/Styles
         self.chat_log.tag_config("system_tag", foreground="#8fcba0", font=ctk.CTkFont(slant="italic"))
+        self.chat_log.tag_config("message_separator", foreground="#555a60")
         self.chat_log.tag_config("rp_system_content", foreground="#a0aab0") # Explicitly controlled system content color
         self.chat_log.tag_config("rp_narrative", foreground="#92979d")       # Action/Description base color
         self.chat_log.tag_config("rp_dialogue", foreground="#d9dde3")        # Spoken text base color
@@ -607,6 +610,65 @@ class OrganizedRoleplayApp(ctk.CTk):
         self.chat_log.insert(tk.END, f"{text}\n")
         self.chat_log.configure(state="disabled")
         self.chat_log.see(tk.END)
+
+    def _configure_header_tab(self, _event=None):
+        """Place embedded ellipsis controls at the right edge of message headers."""
+        width = self.chat_log._textbox.winfo_width()
+        self.chat_log._textbox.configure(tabs=(max(160, width - 44),))
+
+    def clear_chat_message_controls(self):
+        """Destroy embedded buttons before clearing or rebuilding the Text timeline."""
+        for button in self.chat_menu_buttons:
+            button.destroy()
+        self.chat_menu_buttons = []
+
+    def append_message_header(self, title, tag, role, turn_index):
+        """Add a compact header with a minimal ellipsis menu trigger."""
+        self._configure_header_tab()
+        self.chat_log.insert(tk.END, f"\n{title}", tag)
+        self.chat_log.insert(tk.END, "\t")
+        menu_button = ctk.CTkButton(
+            self.chat_log._textbox,
+            text="•••",
+            width=26,
+            height=20,
+            corner_radius=10,
+            fg_color="transparent",
+            hover_color="#4b5056",
+            text_color="#969ba1",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda current_role=role, index=turn_index: self.open_message_context_menu(
+                menu_button, current_role, index
+            ),
+        )
+        self.chat_log._textbox.window_create(tk.END, window=menu_button, align="center")
+        self.chat_menu_buttons.append(menu_button)
+        self.chat_log.insert(tk.END, "\n")
+
+    def append_message_separator(self):
+        """Visually separate messages without replacing the text timeline with cards."""
+        self.chat_log.insert(tk.END, "─" * 96 + "\n", "message_separator")
+
+    def open_message_context_menu(self, button, role, turn_index):
+        """Show the role-specific actions beside the selected ellipsis button."""
+        menu = tk.Menu(
+            self, tearoff=False, background="#34383d", foreground="#d9dde3",
+            activebackground="#4b5056", activeforeground="#ffffff", borderwidth=0,
+            font=("Segoe UI", 10),
+        )
+        if role == "assistant":
+            menu.add_command(label="Reroll", command=lambda: self.handle_reroll_message(turn_index))
+            menu.add_separator()
+            menu.add_command(label="Previous version", command=lambda: self.handle_cycle_reroll(turn_index, -1))
+            menu.add_command(label="Next version", command=lambda: self.handle_cycle_reroll(turn_index, 1))
+        elif role == "user":
+            menu.add_command(label="Delete this message and later", command=lambda: self.handle_delete_from_message(turn_index))
+        else:
+            return
+        try:
+            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        finally:
+            menu.grab_release()
 
     def load_settings_into_ui(self, settings: dict):
         """Safely populates UI forms with settings loaded by main.py controllers."""
@@ -769,6 +831,15 @@ class OrganizedRoleplayApp(ctk.CTk):
 
     # --- STUB OVERRIDES (TO BE ASSIGNED BY MAIN.PY ORCHESTRATORS) ---
     def handle_chat_sent(self):
+        pass
+
+    def handle_reroll_message(self, turn_index):
+        pass
+
+    def handle_cycle_reroll(self, turn_index, direction):
+        pass
+
+    def handle_delete_from_message(self, turn_index):
         pass
 
     def simulate_manual_summary(self):
