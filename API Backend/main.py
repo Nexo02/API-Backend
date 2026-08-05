@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LoreEngine v1.1 - Controller & Session Memory Orchestrator
+LoreEngine v1.2 - Controller & Session Memory Orchestrator
 Responsible for loading configurations, tracking active sessions, managing
 the local character catalogs, and binding visual interfaces securely.
 """
@@ -45,9 +45,10 @@ class PersistentDbManager:
             "temperature": 0.85,
             "max_tokens": 1024,
             "context_size": 8000,
-            "max_context_messages": 10,
+            "max_context_messages": 20,
             "font_size": 14,
-            "memory_extraction_enabled": False
+            "memory_extraction_enabled": False,
+            "show_avatars": True  # <-- Default setting added
         }
 
     def load_settings(self) -> dict:
@@ -309,7 +310,7 @@ class RoleplayOrchestrator:
 
         if not session_was_loaded:
             self.app.append_system_msg(
-                "LoreEngine v1.1 Active Session Controller initialized.\n"
+                "LoreEngine v1.2 Active Session Controller initialized.\n"
                 "Go to the 'Characters' tab to create a character and launch a chat!"
             )
 
@@ -322,6 +323,8 @@ class RoleplayOrchestrator:
         self.app.handle_reroll_message = self.trigger_reroll
         self.app.handle_cycle_reroll = self.cycle_reroll
         self.app.handle_delete_from_message = self.delete_from_message
+        self.app.handle_save_settings = self.on_settings_saved
+        self.app.handle_chat_display_refresh = self.render_active_memory_to_ui
 
         # Character/Session system hooks
         self.app.handle_character_dropdown_changed = self.on_character_changed
@@ -575,7 +578,10 @@ class RoleplayOrchestrator:
         selected_value = self.app.session_dropdown.get()
         if not selected_value or "sessions" in selected_value:
             return
-        
+
+        # Lock in the current in-memory timeline before switching sessions.
+        self.commit_active_session_history()
+
         self.active_bot_name = selected_value.split("|")[0].split("(")[0].strip()
 
         selected_file = self.session_display_to_file.get(selected_value, selected_value)
@@ -620,27 +626,66 @@ class RoleplayOrchestrator:
         self.app.lore_label.configure(text=f"Vector Lorebook Nodes: {len(self.memory.lorebook_db)}")
         self.app.summary_label.configure(text=f"Stored Epic Summaries: {len(self.memory.episodic_logs)}")
 
+    def commit_active_session_history(self):
+        """Persist the currently selected in-memory chat timeline to disk."""
+        if not self.memory.active_filename:
+            return
+        self.db.save_session_history(self.memory.active_filename, self.memory.active_turns)
+
+    def get_character_avatar_path(self, character_name: str) -> str:
+        """Returns the avatar path for the active character, including safe filename fallback matching."""
+        if character_name in self.characters:
+            return self.characters.get(character_name, {}).get("avatar", "")
+
+        normalized_character_name = re.sub(r'[^a-zA-Z0-9]', '', character_name).lower()
+        for saved_name, profile in self.characters.items():
+            normalized_saved_name = re.sub(r'[^a-zA-Z0-9]', '', saved_name).lower()
+            if normalized_saved_name == normalized_character_name:
+                return profile.get("avatar", "")
+
+        return ""
+
+    def get_user_avatar_path(self, user_name: str) -> str:
+        """Returns the avatar path for the displayed user speaker."""
+        if user_name in self.users:
+            return self.users.get(user_name, {}).get("avatar", "")
+
+        if self.active_user_name in self.users:
+            return self.users.get(self.active_user_name, {}).get("avatar", "")
+
+        return ""
+
     def build_chat_messages(self, user_message: str) -> List[Dict[str, str]]:
         """
         Builds the structured message list for a roleplay completion.
-
-        Message order:
-        1. Global system prompt
-        2. Temporary keyword memory block derived from the current message window
-        3. Recent conversation window
-        4. Current user message
-
-        The temporary keyword block is intentionally smaller than the permanent
-        lorebook so it behaves like a short-term memory layer.
         """
         messages: List[Dict[str, str]] = []
 
+        # 1. Global System Prompt
         system_prompt = self.global_settings.get("system_prompt", "")
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
+        # --- NEW: INJECT CHARACTER PROFILE ---
+        char_profile = self.characters.get(self.active_bot_name, {}).get("description", "")
+        if char_profile:
+            messages.append({
+                "role": "system",
+                "content": f"You are playing the role of {self.active_bot_name}.\nCharacter Description:\n{char_profile}"
+            })
+
+        # --- NEW: INJECT USER PROFILE ---
+        user_profile = self.users.get(self.active_user_name, {}).get("description", "")
+        if user_profile and self.active_user_name != "New User...":
+            messages.append({
+                "role": "system",
+                "content": f"The user you are interacting with is {self.active_user_name}.\nUser Description/Persona:\n{user_profile}"
+            })
+
+        # 2. Formatting Rules
         formatting_context = (
             "Roleplay formatting rules:\n"
+            "- Do not write the Characters or Users names in your responses, but use 'I' and 'You'\n"
             "- Use double quotes (\"...\") for spoken dialogue.\n"
             "- Use single quotes ('...') for internal thoughts/monologue.\n"
             "- Use single asterisks (*...*) for bolding important text.\n"
@@ -649,29 +694,59 @@ class RoleplayOrchestrator:
         )
         messages.append({"role": "system", "content": formatting_context})
 
-        recent_context = self.memory.get_recent_context(
-            max_messages=int(self.global_settings.get("max_context_messages", 10))
-        )
+        max_context_messages = int(self.global_settings.get("max_context_messages", 10))
+        recent_context = self.memory.get_recent_context(max_messages=max_context_messages)
+
+        # --- FIX: STRIP UNWANTED TRAILING MESSAGES ---
+        # 1. If rerolling, recent_context ends with the old assistant reply. Strip it so the model never sees it!
+        if recent_context and recent_context[-1].get("role") == "assistant":
+            recent_context = recent_context[:-1]
+
+        # 2. Strip the matching user turn so it isn't duplicated when final_user_msg is added at the end
+        if (
+                recent_context
+                and recent_context[-1].get("role") in ("user", "<user>")
+                and recent_context[-1].get("content", "") == user_message
+        ):
+            recent_context = recent_context[:-1]
+
         context_text_parts = [turn.get("content", "") for turn in recent_context]
         context_text_parts.append(user_message)
         temporary_context = self.memory.build_temporary_context_block(
             reference_text="\n".join(context_text_parts),
-            max_keywords=min(20, int(self.global_settings.get("max_context_messages", 10)) * 2)
+            max_keywords=min(20, max_context_messages * 2)
         )
         if temporary_context:
             messages.append({"role": "system", "content": temporary_context})
 
+        # --- NEW: EXPLICITLY TAG CHAT HISTORY WITH NAMES ---
         for turn in recent_context:
             role = turn.get("role", "user")
+            speaker = turn.get("name", "")
+
             if role == "<user>":
                 role = "user"
             if role not in ("user", "assistant", "system"):
                 role = "user"
+
             content = turn.get("content", "")
             if content:
+                # Prefixing the name makes it explicitly clear who is speaking
+                if role == "user":
+                    display_name = speaker if speaker else self.active_user_name
+                    if display_name != "New User...":
+                        content = f"[{display_name}]: {content}"
+
                 messages.append({"role": role, "content": content})
 
-        messages.append({"role": "user", "content": user_message})
+        # 3. Tag the final, current user message
+        final_user_name = self.active_user_name
+        if final_user_name != "New User...":
+            final_user_msg = f"[{final_user_name}]: {user_message}"
+        else:
+            final_user_msg = user_message
+
+        messages.append({"role": "user", "content": final_user_msg})
         return messages
 
     def _build_roleplay_response(self, user_message: str) -> str:
@@ -695,10 +770,11 @@ class RoleplayOrchestrator:
             max_tokens=int(self.global_settings.get("max_tokens", 1024))
         )
 
-    def _build_extraction_prompt(self, user_message: str, recent_context: List[Dict[str, str]], existing_keywords: List[str]) -> str:
+    def _build_extraction_prompt(self, user_message: str, recent_context: List[Dict[str, str]],
+                                 existing_keywords: List[str], last_bot_message: str = "") -> str:
         """
-        Builds the structured extraction prompt, providing the API with current
-        keywords so it can reuse and map updates to existing entities.
+        Builds a high-precision extraction prompt focused ONLY on long-term persistent lore,
+        filtering out temporary dialogue and minor scene actions.
         """
         context_str = ""
         for turn in recent_context:
@@ -706,10 +782,10 @@ class RoleplayOrchestrator:
             content = turn.get("content", "")
             context_str += f"{role}: {content}\n"
 
-        # Format existing keywords as a clean, readable list for the prompt
-        existing_keywords_str = "\n".join([f"- {key}" for key in existing_keywords]) if existing_keywords else "None"
+        existing_keywords_str = "\n".join(
+            [f"- {key}" for key in existing_keywords]) if existing_keywords else "None"
 
-        return f"""Extract key entities and concepts from this conversation context.
+        return f"""You are an elite lore keeper. Extract ONLY high-value, persistent information from this conversation context.
 
 RECENT CONVERSATION:
 {context_str}
@@ -720,20 +796,28 @@ CURRENT USER MESSAGE:
 EXISTING LOREBOOK KEYWORDS:
 {existing_keywords_str}
 
-TASK:
-Identify important entities (characters, places, objects, events, concepts) described in the recent conversation.
+=== WHAT TO IGNORE (TRIVIAL FLUFF) ===
+- Temporary physical actions or poses (e.g., "sitting down", "nodding", "walking to the window").
+- Transient emotional states or temporary moods (e.g., "is angry right now", "smiled").
+- Conversational fluff, greetings, or short-term dialogue responses.
 
-RULES FOR DUPLICATE PREVENTION & CONSOLIDATION:
-1. Review the "EXISTING LOREBOOK KEYWORDS" list.
-2. If the extracted information relates to an entity already on that list (e.g., Karl's behavior, Karl's sword, Karl's appearance), do NOT create a new keyword. Instead, use the EXACT name of the existing keyword (e.g., "Karl") and write the new detail as the description.
-3. Only create a brand new keyword if the entity is completely unrecognized and undocumented.
-4. Keep descriptions to one brief, concise sentence max.
+=== WHAT TO EXTRACT (MEANINGFUL CONTEXT & LORE) ===
+Extract facts that provide helpful long-term context or mark story progression:
+1. Significant plot progression, major decisions, or key events.
+2. Character developments, personal revelations, backstories, traits, or established preferences.
+3. Notable shifts in relationships, promises made, or agreements reached between characters.
+4. Important items, artifacts, locations, factions, or key terms introduced or acquired.
 
-Return ONLY valid JSON with no markdown formatting:
+=== MERGING & FORMATTING RULES ===
+1. If new information relates to an item in "EXISTING LOREBOOK KEYWORDS", reuse that EXACT entity name (e.g., "Karl") so the system can merge the details seamlessly.
+2. Focus entity names on specific Nouns, Character Names, Locations, or Concepts.
+3. If no noteworthy or memorable facts occurred in this exchange, return an empty "keywords" list: [].
+4. Keep each description to ONE concise, factual sentence.
 
+Return ONLY valid JSON:
 {{
     "keywords": [
-        {{"name": "EntityName", "description": "One sentence description of this entity and its significance"}}
+        {{"name": "EntityName", "description": "One concise sentence describing the meaningful fact, trait, or event."}}
     ]
 }}
 """
@@ -900,13 +984,33 @@ CRITICAL RULES:
                 print("[Memory] Memory extraction disabled: no API key")
                 return
 
-            recent_context = self.memory.get_recent_context(max_messages=5)
-            
+            recent_context = self.memory.get_recent_context(max_messages=20)
+
+            # The current user message was already added to memory before this thread starts.
+            # Keep it only in CURRENT USER MESSAGE, not duplicated inside RECENT CONVERSATION.
+            if (
+                    recent_context
+                    and recent_context[-1].get("role") in ("user", "<user>")
+                    and recent_context[-1].get("content", "") == user_message
+            ):
+                recent_context = recent_context[:-1]
+
+            last_bot_message = ""
+            for turn in reversed(recent_context):
+                if turn.get("role") == "assistant":
+                    last_bot_message = turn.get("content", "")
+                    break
+
             # Grab current lorebook keys to feed to the API
             existing_keys = list(self.memory.lorebook_db.keys())
-            
-            # Pass the existing keys into the prompt builder
-            extraction_prompt = self._build_extraction_prompt(user_message, recent_context, existing_keys)
+
+            # Pass the existing keys and last bot reply into the prompt builder
+            extraction_prompt = self._build_extraction_prompt(
+                user_message=user_message,
+                recent_context=recent_context,
+                existing_keywords=existing_keys,
+                last_bot_message=last_bot_message
+            )
 
             client = OpenRouterClient(api_key)
             print("[Memory] Starting keyword extraction...")
@@ -926,26 +1030,30 @@ CRITICAL RULES:
         except Exception as error:
             print(f"[Memory] Error in keyword extraction: {error}")
 
+
     # ==========================================
     # ACTION DELEGATES (WORKERS)
     # ==========================================
     # ==========================================
     # ACTION DELEGATES & REROLL ENGINE
     # ==========================================
-    def on_chat_sent(self):
+    def on_chat_sent(self, is_edit = False, new_text = None):
         if not self.memory.active_filename:
             self.app.append_system_msg("Please create and launch a Character Chat Session first.")
             return
-
-        user_input = self.app.input_field.get("1.0", tk.END).strip()
+        if is_edit:
+            user_input = new_text
+        else:
+            user_input = self.app.input_field.get("1.0", tk.END).strip()
         if not user_input:
             return
 
         # 1. COMMIT LAST TURN ON NEW SEND
         # Before we append a new user message, we permanently save the last assistant reroll select
-        self.db.save_session_history(self.memory.active_filename, self.memory.active_turns)
+        if not is_edit: self.db.save_session_history(self.memory.active_filename, self.memory.active_turns)
 
         self.app.input_field.delete("1.0", tk.END)
+        self.app.reset_input_field_height()
 
         active_user = self.active_user_name if self.active_user_name != "New User..." else "You"
 
@@ -954,7 +1062,8 @@ CRITICAL RULES:
         self.reroll_index = -1
 
         self.memory.add_user_message(user_input, active_user)
-        self.render_active_memory_to_ui()
+        self.render_turn_to_ui(len(self.memory.active_turns) - 1, self.memory.active_turns[-1])
+        self.app.scroll_chat_to_bottom()
         # We save the user's message to disk immediately
         self.db.save_session_history(self.memory.active_filename, self.memory.active_turns)
         
@@ -974,7 +1083,11 @@ CRITICAL RULES:
 
     def _handle_response_printing(self, text: str):
         """Handles showing the response, pushing to the cache, and deferring disk saving."""
-        # Clean up typography
+        # 1. Automatically strip leading prefixes like "Sam:", "[Sam]:", "Sam: Answer", or "Answer:"
+        prefix_pattern = rf"^(\[{re.escape(self.active_bot_name)}\]:?\s*|{re.escape(self.active_bot_name)}:\s*(Answer:?)?\s*|Answer:\s*)"
+        text = re.sub(prefix_pattern, "", text, flags=re.IGNORECASE).strip()
+
+        # 2. Clean up typography
         text = text.replace("—", " - ").replace("–", " - ")
 
         # Store in reroll cache
@@ -982,45 +1095,70 @@ CRITICAL RULES:
         self.reroll_index = len(self.reroll_cache) - 1
 
         # If we are overwriting an existing temporary turn, pop it first
+        replacing_last_assistant = False
         if self.memory.active_turns and self.memory.active_turns[-1].get("role") == "assistant":
             self.memory.active_turns.pop()
+            replacing_last_assistant = True
 
         # Add to the in-memory state so the UI can render it
         self.memory.add_message("assistant", text)
 
-        # Draw to UI using the live in-memory timeline!
-        self.render_active_memory_to_ui()
-        
+        # Persist the currently selected assistant response immediately.
+        self.commit_active_session_history()
+
+        if replacing_last_assistant:
+            self.render_active_memory_to_ui()
+        else:
+            # Append the new assistant turn without rebuilding the whole chat timeline.
+            self.render_turn_to_ui(len(self.memory.active_turns) - 1, self.memory.active_turns[-1])
+            self.app.scroll_chat_to_bottom()
+
         self.update_sidebar_counters()
         self.rebuild_session_dropdown()
 
+    def render_turn_to_ui(self, turn_index: int, turn: dict):
+        """Append a single memory turn to the chat timeline."""
+        role = turn.get("role", "system")
+        content = turn.get("content", "")
+        speaker = turn.get("name") or turn.get("speaker") or self.active_user_name
+        bot = self.active_bot_name
+
+        user_avatar_path = self.get_user_avatar_path(speaker)
+        bot_avatar_path = self.get_character_avatar_path(bot)
+
+        self.app.append_message_separator()
+        if role in ("user", "<user>"):
+            self.app.append_message_header(
+                f"User: {speaker}",
+                "user_tag",
+                "user",
+                turn_index,
+                avatar_path=user_avatar_path
+            )
+        elif role == "assistant":
+            self.app.append_message_header(
+                f"Bot: {bot}",
+                "bot_tag",
+                "assistant",
+                turn_index,
+                avatar_path=bot_avatar_path
+            )
+        elif role == "system":
+            self.app.append_message_header("System Info", "system_tag", "system", turn_index)
+
+        self.app.append_roleplay_text(content)
+
     def render_active_memory_to_ui(self):
         """Renders the current in-memory active turns directly to the screen without reloading from disk."""
-        self.app.chat_log.configure(state="normal")
         self.app.clear_chat_message_controls()
-        self.app.chat_log.delete("1.0", tk.END)
+        self.app.begin_chat_render()
+        try:
+            for turn_index, turn in enumerate(self.memory.active_turns):
+                self.render_turn_to_ui(turn_index, turn)
+        finally:
+            self.app.finish_chat_render()
 
-        for turn_index, turn in enumerate(self.memory.active_turns):
-            role = turn.get("role", "system")
-            content = turn.get("content", "")
-            speaker = turn.get("name") or turn.get("speaker") or self.active_user_name
-            bot = self.active_bot_name
-
-            if role in ("user", "<user>"):
-                self.app.append_message_header(f"User: {speaker}", "user_tag", "user", turn_index)
-                self.app.append_roleplay_text(content)
-                self.app.append_message_separator()
-            elif role == "assistant":
-                self.app.append_message_header(f"Bot: {bot}", "bot_tag", "assistant", turn_index)
-                self.app.append_roleplay_text(content)
-                self.app.append_message_separator()
-            elif role == "system":
-                self.app.append_message_header("System Info", "system_tag", "system", turn_index)
-                self.app.append_roleplay_text(content)
-                self.app.append_message_separator()
-
-        self.app.chat_log.configure(state="disabled")
-        self.app.chat_log.see(tk.END)
+        self.app.scroll_chat_to_bottom()
 
     def trigger_reroll(self, turn_index=None):
         """Initiates a reroll of the last assistant turn, discarding it from disk and fetching a new response."""
@@ -1069,6 +1207,9 @@ CRITICAL RULES:
             # Update in-memory state
             if self.memory.active_turns and self.memory.active_turns[-1].get("role") == "assistant":
                 self.memory.active_turns[-1]["content"] = selected_text
+
+            # Persist whichever reroll version is currently selected.
+            self.commit_active_session_history()
 
             # Render from live memory
             self.render_active_memory_to_ui()
@@ -1128,7 +1269,7 @@ CRITICAL RULES:
         current_ui_state["active_user"] = self.active_user_name
         self.db.save_settings(current_ui_state)
         self.app.destroy()
-    
+
     def delete_last_message(self):
         """Deletes the absolute last message (from screen and file) to step back in time."""
         if not self.memory.active_turns:
@@ -1146,12 +1287,24 @@ CRITICAL RULES:
 
         # Commit deletion to persistent storage immediately
         self.db.save_session_history(self.memory.active_filename, self.memory.active_turns)
-        
+
         # Redraw screen directly from active memory state
         self.render_active_memory_to_ui()
         self.app.append_system_msg(f"Deleted last {role} message: '{content_preview}...'")
-    
-    
+
+    def on_settings_saved(self):
+        """Persist current settings from the Settings tab without closing the app."""
+        current_ui_state = self.app.get_current_ui_settings()
+        current_ui_state["active_user"] = self.active_user_name
+        self.db.save_settings(current_ui_state)
+        self.global_settings = current_ui_state
+
+        # Sync state and redraw active memory immediately
+        self.app.show_avatars = current_ui_state.get("show_avatars", True)
+        self.render_active_memory_to_ui()
+
+        self.app.append_system_msg("Settings saved successfully.")
+
 
 
 if __name__ == "__main__":
