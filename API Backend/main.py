@@ -41,14 +41,14 @@ class PersistentDbManager:
             "theme_mode": "Dark",
             "api_key": "",
             "model": "deepseek/deepseek-chat",
-            "system_prompt": "You are a creative co-writer and storyteller. Help develop immersive scenes and dialogues.",
+            "system_prompt": "You are a helpful and accurate Assistant. Help develop code, work out problems, answer questions, and provide information.",
             "temperature": 0.85,
             "max_tokens": 1024,
             "context_size": 8000,
             "max_context_messages": 20,
             "font_size": 14,
             "memory_extraction_enabled": False,
-            "show_avatars": True  # <-- Default setting added
+            "show_avatars": False
         }
 
     def load_settings(self) -> dict:
@@ -184,7 +184,7 @@ class SessionMemoryManager:
                 matched_context.append(f"[*] Lorebook ({key.upper()}): {description}")
         return matched_context
 
-    def get_recent_context(self, max_messages: int = 10) -> List[Dict[str, str]]:
+    def get_recent_context(self, max_messages: int = 20) -> List[Dict[str, str]]:
         """
         Returns the last N user/assistant turns for context injection.
         Excludes system messages and only counts actual conversation turns.
@@ -195,28 +195,28 @@ class SessionMemoryManager:
         ]
         return conversation_turns[-max_messages:] if max_messages > 0 else []
 
-    def build_keyword_context_lines(self, max_items: int = 20) -> List[str]:
-        """
-        Converts the active lorebook into a compact list of context lines.
-
-        This is intended for temporary prompt injection so the model can "see"
-        the most relevant short-form memory without needing to ingest the full lorebook.
-
-        Args:
-            max_items: Maximum number of lorebook entries to include.
-
-        Returns:
-            A list of formatted lines ready to be appended to a system/context prompt.
-        """
-        if not self.lorebook_db:
-            return []
-
-        lines = []
-        for index, (name, description) in enumerate(self.lorebook_db.items()):
-            if index >= max_items:
-                break
-            lines.append(f"- {name}: {description}")
-        return lines
+    # def build_keyword_context_lines(self, max_items: int = 20) -> List[str]:
+    #     """
+    #     Converts the active lorebook into a compact list of context lines.
+    #
+    #     This is intended for temporary prompt injection so the model can "see"
+    #     the most relevant short-form memory without needing to ingest the full lorebook.
+    #
+    #     Args:
+    #         max_items: Maximum number of lorebook entries to include.
+    #
+    #     Returns:
+    #         A list of formatted lines ready to be appended to a system/context prompt.
+    #     """
+    #     if not self.lorebook_db:
+    #         return []
+    #
+    #     lines = []
+    #     for index, (name, description) in enumerate(self.lorebook_db.items()):
+    #         if index >= max_items:
+    #             break
+    #         lines.append(f"- {name}: {description}")
+    #     return lines
 
     def build_temporary_context_block(self, reference_text: str = "", max_keywords: int = 20) -> str:
         """
@@ -666,7 +666,6 @@ class RoleplayOrchestrator:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
 
-        # --- NEW: INJECT CHARACTER PROFILE ---
         char_profile = self.characters.get(self.active_bot_name, {}).get("description", "")
         if char_profile:
             messages.append({
@@ -674,7 +673,6 @@ class RoleplayOrchestrator:
                 "content": f"You are playing the role of {self.active_bot_name}.\nCharacter Description:\n{char_profile}"
             })
 
-        # --- NEW: INJECT USER PROFILE ---
         user_profile = self.users.get(self.active_user_name, {}).get("description", "")
         if user_profile and self.active_user_name != "New User...":
             messages.append({
@@ -984,7 +982,7 @@ CRITICAL RULES:
                 print("[Memory] Memory extraction disabled: no API key")
                 return
 
-            recent_context = self.memory.get_recent_context(max_messages=20)
+            recent_context = self.memory.get_recent_context(max_messages=10)
 
             # The current user message was already added to memory before this thread starts.
             # Keep it only in CURRENT USER MESSAGE, not duplicated inside RECENT CONVERSATION.
