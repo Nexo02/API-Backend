@@ -45,7 +45,7 @@ class PersistentDbManager:
             "temperature": 0.85,
             "max_tokens": 1024,
             "context_size": 8000,
-            "max_context_messages": 20,
+            "max_context_messages": 30,
             "font_size": 14,
             "memory_extraction_enabled": False,
             "show_avatars": False

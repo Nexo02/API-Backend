@@ -120,7 +120,7 @@ class OrganizedRoleplayApp(ctk.CTk):
 
         self.model_dropdown = ctk.CTkOptionMenu(
             tab,
-            values=["deepseek/deepseek-chat", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v3.2"]
+            values=["deepseek/deepseek-chat", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v3.2", "deepseek/deepseek-v4-pro"]
         )
         self.model_dropdown.pack(fill="x", pady=(0, 15))
         self.accent_widgets.append((self.model_dropdown, "optionmenu"))
