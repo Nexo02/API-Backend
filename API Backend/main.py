@@ -42,11 +42,11 @@ class PersistentDbManager:
             "api_key": "",
             "model": "deepseek/deepseek-chat",
             "system_prompt": "You are a helpful and accurate Assistant. Help develop code, work out problems, answer questions, and provide information.",
-            "temperature": 0.85,
+            "temperature": 1.0,
             "max_tokens": 1024,
-            "context_size": 8000,
-            "max_context_messages": 30,
-            "font_size": 14,
+            "context_size": 16384,
+            "max_context_messages": 40,
+            "font_size": 16,
             "memory_extraction_enabled": False,
             "show_avatars": False
         }
@@ -679,6 +679,11 @@ class RoleplayOrchestrator:
                 "role": "system",
                 "content": f"The user you are interacting with is {self.active_user_name}.\nUser Description/Persona:\n{user_profile}"
             })
+
+        messages.append({
+            "role": "system",
+            "content": f"The current date and time is {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
+        })
 
         # 2. Formatting Rules
         formatting_context = (
